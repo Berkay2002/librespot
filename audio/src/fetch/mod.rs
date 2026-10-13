@@ -180,6 +180,20 @@ impl StreamLoaderController {
         }
     }
 
+    /// Bytes downloaded contiguously from the start of the file. Grows while a
+    /// download makes progress, so callers can tell a slow link from a stalled one.
+    pub fn downloaded_len(&self) -> usize {
+        match self.stream_shared {
+            Some(ref shared) => shared
+                .download_status
+                .lock()
+                .expect(DOWNLOAD_STATUS_POISON_MSG)
+                .downloaded
+                .contained_length_from_value(0),
+            None => self.len(),
+        }
+    }
+
     pub fn range_to_end_available(&self) -> bool {
         match self.stream_shared {
             Some(ref shared) => {
