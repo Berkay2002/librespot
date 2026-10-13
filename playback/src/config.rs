@@ -135,6 +135,8 @@ pub struct PlayerConfig {
     /// Setting this will enable periodically sending events during playback informing about the playback position
     /// To consume the PlayerEvent::PositionChanged event, listen to events via `Player::get_player_event_channel()``
     pub position_update_interval: Option<Duration>,
+    /// Overlaps the end of each track with the start of the next when set.
+    pub transitions: Option<Arc<dyn crate::transition::Transitions>>,
 }
 
 impl Default for PlayerConfig {
@@ -154,6 +156,7 @@ impl Default for PlayerConfig {
             passthrough: false,
             ditherer: Some(mk_ditherer::<TriangularDitherer>),
             position_update_interval: None,
+            transitions: None,
             local_file_directories: Vec::new(),
         }
     }

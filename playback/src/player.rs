@@ -31,6 +31,7 @@ use crate::{
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
+    transition::TransitionMix,
 };
 use futures_util::{
     StreamExt, TryFutureExt, future, future::FusedFuture,
@@ -42,7 +43,7 @@ use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::SAMPLES_PER_SECOND;
+use crate::{NUM_CHANNELS, SAMPLE_RATE, SAMPLES_PER_SECOND};
 
 const PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS: u32 = 30000;
 pub const DB_VOLTAGE_RATIO: f64 = 20.0;
@@ -97,6 +98,55 @@ struct PlayerInternal {
     last_progress_update: Instant,
 
     local_file_lookup: Arc<LocalFileLookup>,
+
+    /// The next track while it overlaps the end of the current one.
+    transition: Option<ActiveTransition>,
+    /// The next track after an overlap handed over to it: its load keeps the
+    /// position the overlap reached instead of seeking to the start.
+    handover: Option<SpotifyUri>,
+}
+
+struct ActiveTransition {
+    track_id: SpotifyUri,
+    loaded_track: Box<PlayerLoadedTrackData>,
+    mix: Box<dyn TransitionMix>,
+    /// The next track's normalisation relative to the current one's, which
+    /// the mixed packet gets on its way out.
+    relative_gain: f64,
+    position: u64,
+    length: u64,
+    /// Decoded samples of the next track not mixed yet.
+    pending: Vec<f64>,
+    ended: bool,
+}
+
+impl ActiveTransition {
+    /// Mixes the next track into `a`, decoding as much of it as `a` needs.
+    fn mix_into(&mut self, a: &mut [f64]) {
+        while self.pending.len() < a.len() && !self.ended {
+            match self.loaded_track.decoder.next_packet() {
+                Ok(Some((position, AudioPacket::Samples(samples)))) => {
+                    self.loaded_track.stream_position_ms = position.position_ms;
+                    let gain = self.relative_gain;
+                    self.pending
+                        .extend(samples.iter().map(|sample| sample * gain));
+                }
+                Ok(Some((_, AudioPacket::Raw(_)))) | Ok(None) | Err(_) => self.ended = true,
+            }
+        }
+        if self.pending.len() < a.len() {
+            self.pending.resize(a.len(), 0.0);
+        }
+        let frames = (a.len() / NUM_CHANNELS as usize) as u64;
+        self.mix
+            .mix(a, &self.pending[..a.len()], self.position, self.length);
+        self.pending.drain(..a.len());
+        self.position += frames;
+    }
+
+    fn done(&self) -> bool {
+        self.position >= self.length
+    }
 }
 
 static PLAYER_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -540,6 +590,9 @@ impl Player {
                 last_progress_update: Instant::now(),
 
                 local_file_lookup: Arc::new(local_file_lookup),
+
+                transition: None,
+                handover: None,
             };
 
             // While PlayerInternal is written as a future, it still contains blocking code.
@@ -1509,6 +1562,9 @@ impl Future for PlayerInternal {
 
             if self.state.is_playing() {
                 self.ensure_sink_running();
+                if !passthrough {
+                    self.start_transition_if_due();
+                }
 
                 if let PlayerState::Playing {
                     ref track_id,
@@ -1633,6 +1689,14 @@ impl Future for PlayerInternal {
                 };
             }
 
+            let preload_before_end_ms = self.config.transitions.as_ref().map_or(
+                PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS,
+                |transitions| {
+                    transitions
+                        .preload_before_end_ms()
+                        .max(PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS)
+                },
+            );
             if let PlayerState::Playing {
                 ref track_id,
                 play_request_id,
@@ -1656,7 +1720,7 @@ impl Future for PlayerInternal {
 
                 if (!*suggested_to_preload_next_track)
                     && ((duration_ms as i64 - stream_position_ms as i64)
-                        < PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS as i64)
+                        < preload_before_end_ms as i64)
                     && stream_loader_controller.range_to_end_available()
                 {
                     *suggested_to_preload_next_track = true;
@@ -1675,6 +1739,157 @@ impl Future for PlayerInternal {
 }
 
 impl PlayerInternal {
+    /// Brings the preloaded next track in once playback reaches the start
+    /// of its planned overlap. Only a position just past the start counts,
+    /// so a seek into the overlap plays the track out without one.
+    fn start_transition_if_due(&mut self) {
+        const START_WINDOW_MS: u32 = 1000;
+        let Some(transitions) = self.config.transitions.clone() else {
+            return;
+        };
+        if self.transition.is_some() {
+            return;
+        }
+        let (
+            PlayerState::Playing {
+                track_id: a,
+                duration_ms: a_duration_ms,
+                stream_position_ms,
+                normalisation_factor,
+                ..
+            },
+            PlayerPreload::Ready {
+                track_id: b,
+                loaded_track,
+            },
+        ) = (&self.state, &self.preload)
+        else {
+            return;
+        };
+        let Some(plan) = transitions.plan(a, *a_duration_ms, b, loaded_track.duration_ms) else {
+            return;
+        };
+        let position = *stream_position_ms;
+        if plan.duration_ms == 0
+            || position < plan.start_a_ms
+            || position >= plan.start_a_ms.saturating_add(START_WINDOW_MS)
+        {
+            return;
+        }
+        let a = a.clone();
+        let a_factor = *normalisation_factor;
+        let PlayerPreload::Ready {
+            track_id: b,
+            mut loaded_track,
+        } = mem::replace(&mut self.preload, PlayerPreload::None)
+        else {
+            return;
+        };
+        if loaded_track.stream_position_ms != plan.start_b_ms {
+            match loaded_track.decoder.seek(plan.start_b_ms) {
+                Ok(position_ms) => loaded_track.stream_position_ms = position_ms,
+                Err(e) => {
+                    warn!("Unable to start the transition into <{b:?}>: {e}");
+                    self.preload = PlayerPreload::Ready {
+                        track_id: b,
+                        loaded_track,
+                    };
+                    return;
+                }
+            }
+        }
+        let b_factor = NormalisationData::get_factor(
+            &self.normalisation_config(),
+            loaded_track.normalisation_data,
+        );
+        debug!("Transition from <{a:?}> into <{b:?}>: {plan:?}");
+        let mix = transitions.begin(&a, &b, &plan);
+        self.transition = Some(ActiveTransition {
+            track_id: b,
+            loaded_track,
+            mix,
+            relative_gain: if a_factor > 0.0 {
+                b_factor / a_factor
+            } else {
+                1.0
+            },
+            position: 0,
+            length: u64::from(plan.duration_ms) * u64::from(SAMPLE_RATE) / 1000,
+            pending: Vec::with_capacity(16 * 1024),
+            ended: false,
+        });
+    }
+
+    /// Ends the current track where the overlap ends and makes the next one
+    /// the preloaded track, to be loaded from where the overlap left it.
+    fn finish_transition(&mut self, normalisation_factor: f64) {
+        let Some(mut transition) = self.transition.take() else {
+            return;
+        };
+        // What the next track decoded past the overlap plays as it is.
+        let rest = mem::take(&mut transition.pending);
+        if !rest.is_empty() {
+            let position = AudioPacketPosition {
+                position_ms: transition.loaded_track.stream_position_ms,
+                skipped: false,
+            };
+            self.handle_packet(
+                Some((position, AudioPacket::Samples(rest))),
+                normalisation_factor,
+            );
+        }
+        if self.state.is_playing() {
+            self.state.playing_to_end_of_track();
+            if let PlayerState::EndOfTrack {
+                ref track_id,
+                play_request_id,
+                ..
+            } = self.state
+            {
+                self.send_event(PlayerEvent::EndOfTrack {
+                    track_id: track_id.clone(),
+                    play_request_id,
+                });
+            }
+        }
+        self.handover = Some(transition.track_id.clone());
+        self.preload = PlayerPreload::Ready {
+            track_id: transition.track_id,
+            loaded_track: transition.loaded_track,
+        };
+    }
+
+    /// Stops an overlap in progress. The next track stays preloaded, back at
+    /// its start.
+    fn cancel_transition(&mut self) {
+        let Some(mut transition) = self.transition.take() else {
+            return;
+        };
+        match transition.loaded_track.decoder.seek(0) {
+            Ok(position_ms) => {
+                transition.loaded_track.stream_position_ms = position_ms;
+                self.preload = PlayerPreload::Ready {
+                    track_id: transition.track_id,
+                    loaded_track: transition.loaded_track,
+                };
+            }
+            Err(e) => debug!("Dropping the transition's next track: {e}"),
+        }
+    }
+
+    /// The configuration with automatic normalisation resolved.
+    fn normalisation_config(&self) -> PlayerConfig {
+        let mut config = self.config.clone();
+        if config.normalisation_type == NormalisationType::Auto {
+            if self.auto_normalise_as_album {
+                config.normalisation_type = NormalisationType::Album;
+            } else {
+                config.normalisation_type = NormalisationType::Track;
+            }
+        };
+        config
+    }
+
     fn ensure_sink_running(&mut self) {
         if self.sink_status != SinkStatus::Running {
             trace!("== Starting sink ==");
@@ -1725,6 +1940,7 @@ impl PlayerInternal {
     }
 
     fn handle_player_stop(&mut self) {
+        self.cancel_transition();
         match self.state {
             PlayerState::Playing {
                 ref track_id,
@@ -1830,6 +2046,10 @@ impl PlayerInternal {
             Some((_, mut packet)) => {
                 if !packet.is_empty() {
                     if let AudioPacket::Samples(ref mut data) = packet {
+                        if let Some(transition) = &mut self.transition {
+                            transition.mix_into(data);
+                        }
+
                         // Get the volume for the packet. In the case of hardware volume control
                         // this will always be 1.0 (no change).
                         let volume = self.volume_getter.attenuation_factor();
@@ -1927,7 +2147,14 @@ impl PlayerInternal {
                         self.handle_pause();
                     }
                 }
+                if self.transition.as_ref().is_some_and(ActiveTransition::done)
+                    && self.state.is_playing()
+                {
+                    self.finish_transition(normalisation_factor);
+                }
             }
+
+            None if self.transition.is_some() => self.finish_transition(normalisation_factor),
 
             None => {
                 self.state.playing_to_end_of_track();
@@ -2037,6 +2264,21 @@ impl PlayerInternal {
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
 
         self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
+
+        // Loading the track an overlap brings in, at its start, as a skip
+        // during the overlap or the queue's own advance after it does,
+        // carries on from where the overlap has it.
+        let mut handover = self.handover.take();
+        if let Some(transition) = self.transition.take() {
+            if transition.track_id == track_id && position_ms == 0 {
+                handover = Some(transition.track_id.clone());
+                self.preload = PlayerPreload::Ready {
+                    track_id: transition.track_id,
+                    loaded_track: transition.loaded_track,
+                };
+            }
+        }
+        let handover = handover.is_some_and(|handover| handover == track_id && position_ms == 0);
 
         if !self.config.gapless {
             self.ensure_sink_stopped(play);
@@ -2178,7 +2420,7 @@ impl PlayerInternal {
                     mut loaded_track,
                 } = preload
                 {
-                    if position_ms != loaded_track.stream_position_ms {
+                    if position_ms != loaded_track.stream_position_ms && !handover {
                         // This may be blocking
                         loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
                     }
@@ -2240,6 +2482,13 @@ impl PlayerInternal {
     fn handle_command_preload(&mut self, track_id: SpotifyUri) {
         debug!("Preloading track");
         let mut preload_track = true;
+        // A queue change during an overlap: the track coming in is no
+        // longer next.
+        match &self.transition {
+            Some(transition) if transition.track_id == track_id => return,
+            Some(_) => self.transition = None,
+            None => {}
+        }
         // check whether the track is already loaded somewhere or being loaded.
         if let PlayerPreload::Loading {
             track_id: currently_loading,
@@ -2289,6 +2538,8 @@ impl PlayerInternal {
     }
 
     fn handle_command_seek(&mut self, position_ms: u32) -> PlayerResult {
+        self.cancel_transition();
+        self.handover = None;
         // When we are still loading, the user may immediately ask to
         // seek to another position yet the decoder won't be ready for
         // that. In this case just restart the loading process but
