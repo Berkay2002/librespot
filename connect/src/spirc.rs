@@ -1720,7 +1720,9 @@ impl SpircTask {
 
     fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {
         self.player.emit_shuffle_changed_event(shuffle);
-        self.connect_state.handle_shuffle(shuffle)
+        self.connect_state.handle_shuffle(shuffle)?;
+        self.emit_set_queue_event();
+        Ok(())
     }
 
     fn handle_repeat_context(&mut self, repeat: bool) -> Result<(), Error> {
@@ -2003,6 +2005,7 @@ impl SpircTask {
             self.play_status = SpircPlayStatus::LoadingPause { position_ms };
         }
         self.connect_state.set_status(&self.play_status);
+        self.emit_set_queue_event();
 
         Ok(())
     }
