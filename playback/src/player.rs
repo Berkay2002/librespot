@@ -20,7 +20,7 @@ use std::{
 #[cfg(feature = "passthrough-decoder")]
 use crate::decoder::PassthroughDecoder;
 use crate::{
-    audio::{AudioDecrypt, AudioFetchParams, AudioFile, StreamLoaderController},
+    audio::{AudioDecrypt, AudioFetchParams, AudioFile, Range, StreamLoaderController},
     audio_backend::Sink,
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
@@ -104,6 +104,9 @@ struct PlayerInternal {
     /// The next track after an overlap handed over to it: its load keeps the
     /// position the overlap reached instead of seeking to the start.
     handover: Option<SpotifyUri>,
+    /// The next track and position whose bytes were asked for, so an overlap
+    /// that starts inside the track does not seek over the network.
+    transition_fetch: Option<(SpotifyUri, u32)>,
 }
 
 struct ActiveTransition {
@@ -118,7 +121,21 @@ struct ActiveTransition {
     /// Decoded samples of the next track not mixed yet.
     pending: Vec<f64>,
     ended: bool,
+    /// Overlap frames per output frame: more than one when the current
+    /// track ended early and the rest of the overlap is run through quickly.
+    speed: u64,
+    /// Frames left of a fade back to the current track alone, once the
+    /// next track is no longer next.
+    release: Option<u64>,
+    /// The current track's packet before mixing, for that fade.
+    dry: Vec<f64>,
 }
+
+/// How long the fade back to the current track takes when the queue changes
+/// during an overlap.
+const RELEASE_FRAMES: u64 = SAMPLE_RATE as u64 / 20;
+/// How long the rest of an overlap takes when the current track ends early.
+const RUSH_FRAMES: u64 = SAMPLE_RATE as u64;
 
 impl ActiveTransition {
     /// Mixes the next track into `a`, decoding as much of it as `a` needs.
@@ -138,14 +155,36 @@ impl ActiveTransition {
             self.pending.resize(a.len(), 0.0);
         }
         let frames = (a.len() / NUM_CHANNELS as usize) as u64;
+        if self.release.is_some() {
+            self.dry.clear();
+            self.dry.extend_from_slice(a);
+        }
         self.mix
             .mix(a, &self.pending[..a.len()], self.position, self.length);
         self.pending.drain(..a.len());
-        self.position += frames;
+        self.position += frames * self.speed;
+        if let Some(left) = &mut self.release {
+            let channels = NUM_CHANNELS as usize;
+            for (frame, (a, dry)) in a
+                .chunks_exact_mut(channels)
+                .zip(self.dry.chunks_exact(channels))
+                .enumerate()
+            {
+                let wet = left.saturating_sub(frame as u64) as f64 / RELEASE_FRAMES as f64;
+                for (a, dry) in a.iter_mut().zip(dry) {
+                    *a = dry + (*a - dry) * wet;
+                }
+            }
+            *left = left.saturating_sub(frames);
+        }
     }
 
     fn done(&self) -> bool {
         self.position >= self.length
+    }
+
+    fn released(&self) -> bool {
+        self.release == Some(0)
     }
 }
 
@@ -593,6 +632,7 @@ impl Player {
 
                 transition: None,
                 handover: None,
+                transition_fetch: None,
             };
 
             // While PlayerInternal is written as a future, it still contains blocking code.
@@ -1770,10 +1810,27 @@ impl PlayerInternal {
             return;
         };
         let position = *stream_position_ms;
+        // Starting inside the next track means seeking it, which must not
+        // wait on the network: ask for the whole file now, and start only
+        // once it is here.
+        let controller = &loaded_track.stream_loader_controller;
+        let downloaded = controller.downloaded_len() >= controller.len();
+        if plan.start_b_ms > 0 && !downloaded {
+            let wanted = Some((b.clone(), plan.start_b_ms));
+            if self.transition_fetch != wanted {
+                controller.fetch(Range::new(0, controller.len()));
+                self.transition_fetch = wanted;
+            }
+        }
         if plan.duration_ms == 0
             || position < plan.start_a_ms
             || position >= plan.start_a_ms.saturating_add(START_WINDOW_MS)
         {
+            return;
+        }
+        if plan.start_b_ms > 0 && !downloaded && loaded_track.stream_position_ms != plan.start_b_ms
+        {
+            info!("Skipping the transition into <{b:?}>: its start is not downloaded yet");
             return;
         }
         let a = a.clone();
@@ -1817,7 +1874,44 @@ impl PlayerInternal {
             length: u64::from(plan.duration_ms) * u64::from(SAMPLE_RATE) / 1000,
             pending: Vec::with_capacity(16 * 1024),
             ended: false,
+            speed: 1,
+            release: None,
+            dry: Vec::with_capacity(16 * 1024),
         });
+    }
+
+    /// The current track ended before its overlap did: runs the rest of the
+    /// overlap's curves over a short stretch of the next track instead of
+    /// cutting to it unshaped.
+    fn rush_transition(&mut self, normalisation_factor: f64) {
+        const CHUNK_FRAMES: usize = 256;
+        let position_ms = match self.state {
+            PlayerState::Playing {
+                stream_position_ms, ..
+            } => stream_position_ms,
+            _ => 0,
+        };
+        if let Some(transition) = &mut self.transition {
+            let left = transition.length.saturating_sub(transition.position);
+            transition.speed = left.div_ceil(RUSH_FRAMES).max(1);
+        }
+        while self
+            .transition
+            .as_ref()
+            .is_some_and(|transition| !transition.done())
+            && self.state.is_playing()
+        {
+            let silence = vec![0.0; CHUNK_FRAMES * NUM_CHANNELS as usize];
+            let position = AudioPacketPosition {
+                position_ms,
+                skipped: false,
+            };
+            self.handle_packet(
+                Some((position, AudioPacket::Samples(silence))),
+                normalisation_factor,
+            );
+        }
+        self.finish_transition(normalisation_factor);
     }
 
     /// Ends the current track where the overlap ends and makes the next one
@@ -2147,14 +2241,26 @@ impl PlayerInternal {
                         self.handle_pause();
                     }
                 }
-                if self.transition.as_ref().is_some_and(ActiveTransition::done)
-                    && self.state.is_playing()
-                {
-                    self.finish_transition(normalisation_factor);
+                match &self.transition {
+                    Some(transition) if transition.release.is_some() => {
+                        if transition.released() || transition.done() {
+                            self.transition = None;
+                        }
+                    }
+                    Some(transition) if transition.done() && self.state.is_playing() => {
+                        self.finish_transition(normalisation_factor);
+                    }
+                    _ => {}
                 }
             }
 
-            None if self.transition.is_some() => self.finish_transition(normalisation_factor),
+            None if self
+                .transition
+                .as_ref()
+                .is_some_and(|transition| transition.release.is_none()) =>
+            {
+                self.rush_transition(normalisation_factor);
+            }
 
             None => {
                 self.state.playing_to_end_of_track();
@@ -2484,9 +2590,13 @@ impl PlayerInternal {
         let mut preload_track = true;
         // A queue change during an overlap: the track coming in is no
         // longer next.
-        match &self.transition {
-            Some(transition) if transition.track_id == track_id => return,
-            Some(_) => self.transition = None,
+        match &mut self.transition {
+            Some(transition) if transition.track_id == track_id && transition.release.is_none() => {
+                return;
+            }
+            Some(transition) => {
+                transition.release.get_or_insert(RELEASE_FRAMES);
+            }
             None => {}
         }
         // check whether the track is already loaded somewhere or being loaded.
