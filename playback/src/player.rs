@@ -24,7 +24,9 @@ use crate::{
     audio_backend::Sink,
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
-    core::{Error, Session, SpotifyId, SpotifyUri, audio_key::AudioKeyError, util::SeqGenerator},
+    core::{
+        Error, FileId, Session, SpotifyId, SpotifyUri, audio_key::AudioKeyError, util::SeqGenerator,
+    },
     decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, SymphoniaDecoder},
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
@@ -955,6 +957,72 @@ impl PlayerState {
     }
 }
 
+/// Picks the file to play for `bitrate`: the first format in preference order
+/// that `files` contains. (Most) podcasts seem to support only 96 kbps Ogg Vorbis,
+/// so the other bitrates are fallbacks.
+pub fn select_file(files: &AudioFiles, bitrate: Bitrate) -> Option<(AudioFileFormat, FileId)> {
+    let formats = match bitrate {
+        Bitrate::Bitrate96 => [
+            AudioFileFormat::OGG_VORBIS_96,
+            AudioFileFormat::MP3_96,
+            AudioFileFormat::OGG_VORBIS_160,
+            AudioFileFormat::MP3_160,
+            AudioFileFormat::MP3_256,
+            AudioFileFormat::OGG_VORBIS_320,
+            AudioFileFormat::MP3_320,
+        ],
+        Bitrate::Bitrate160 => [
+            AudioFileFormat::OGG_VORBIS_160,
+            AudioFileFormat::MP3_160,
+            AudioFileFormat::OGG_VORBIS_96,
+            AudioFileFormat::MP3_96,
+            AudioFileFormat::MP3_256,
+            AudioFileFormat::OGG_VORBIS_320,
+            AudioFileFormat::MP3_320,
+        ],
+        Bitrate::Bitrate320 => [
+            AudioFileFormat::OGG_VORBIS_320,
+            AudioFileFormat::MP3_320,
+            AudioFileFormat::MP3_256,
+            AudioFileFormat::OGG_VORBIS_160,
+            AudioFileFormat::MP3_160,
+            AudioFileFormat::OGG_VORBIS_96,
+            AudioFileFormat::MP3_96,
+        ],
+    };
+
+    formats
+        .iter()
+        .find_map(|format| files.get(format).map(|&file_id| (*format, file_id)))
+}
+
+/// Approximate stream data rate in bytes per second for a file format.
+pub fn stream_data_rate(format: AudioFileFormat) -> Option<usize> {
+    let kbps = match format {
+        AudioFileFormat::OGG_VORBIS_96 => 12.,
+        AudioFileFormat::OGG_VORBIS_160 => 20.,
+        AudioFileFormat::OGG_VORBIS_320 => 40.,
+        AudioFileFormat::MP3_256 => 32.,
+        AudioFileFormat::MP3_320 => 40.,
+        AudioFileFormat::MP3_160 => 20.,
+        AudioFileFormat::MP3_96 => 12.,
+        AudioFileFormat::MP3_160_ENC => 20.,
+        AudioFileFormat::AAC_24 => 3.,
+        AudioFileFormat::AAC_48 => 6.,
+        AudioFileFormat::AAC_160 => 20.,
+        AudioFileFormat::AAC_320 => 40.,
+        AudioFileFormat::MP4_128 => 16.,
+        AudioFileFormat::OTHER5 => 40.,
+        AudioFileFormat::FLAC_FLAC => 112., // assume 900 kbit/s on average
+        AudioFileFormat::XHE_AAC_12 => 1.5,
+        AudioFileFormat::XHE_AAC_16 => 2.,
+        AudioFileFormat::XHE_AAC_24 => 3.,
+        AudioFileFormat::FLAC_FLAC_24BIT => 3.,
+    };
+    let data_rate: f32 = kbps * 1024.;
+    Some(data_rate.ceil() as usize)
+}
+
 struct PlayerTrackLoader {
     session: Session,
     config: PlayerConfig,
@@ -992,32 +1060,6 @@ impl PlayerTrackLoader {
             error!("Track should be available, but no alternatives found.");
             None
         }
-    }
-
-    fn stream_data_rate(&self, format: AudioFileFormat) -> Option<usize> {
-        let kbps = match format {
-            AudioFileFormat::OGG_VORBIS_96 => 12.,
-            AudioFileFormat::OGG_VORBIS_160 => 20.,
-            AudioFileFormat::OGG_VORBIS_320 => 40.,
-            AudioFileFormat::MP3_256 => 32.,
-            AudioFileFormat::MP3_320 => 40.,
-            AudioFileFormat::MP3_160 => 20.,
-            AudioFileFormat::MP3_96 => 12.,
-            AudioFileFormat::MP3_160_ENC => 20.,
-            AudioFileFormat::AAC_24 => 3.,
-            AudioFileFormat::AAC_48 => 6.,
-            AudioFileFormat::AAC_160 => 20.,
-            AudioFileFormat::AAC_320 => 40.,
-            AudioFileFormat::MP4_128 => 16.,
-            AudioFileFormat::OTHER5 => 40.,
-            AudioFileFormat::FLAC_FLAC => 112., // assume 900 kbit/s on average
-            AudioFileFormat::XHE_AAC_12 => 1.5,
-            AudioFileFormat::XHE_AAC_16 => 2.,
-            AudioFileFormat::XHE_AAC_24 => 3.,
-            AudioFileFormat::FLAC_FLAC_24BIT => 3.,
-        };
-        let data_rate: f32 = kbps * 1024.;
-        Some(data_rate.ceil() as usize)
     }
 
     async fn load_track(
@@ -1072,57 +1114,18 @@ impl PlayerTrackLoader {
             audio_item.name, audio_item.uri
         );
 
-        // (Most) podcasts seem to support only 96 kbps Ogg Vorbis, so fall back to it
-        let formats = match self.config.bitrate {
-            Bitrate::Bitrate96 => [
-                AudioFileFormat::OGG_VORBIS_96,
-                AudioFileFormat::MP3_96,
-                AudioFileFormat::OGG_VORBIS_160,
-                AudioFileFormat::MP3_160,
-                AudioFileFormat::MP3_256,
-                AudioFileFormat::OGG_VORBIS_320,
-                AudioFileFormat::MP3_320,
-            ],
-            Bitrate::Bitrate160 => [
-                AudioFileFormat::OGG_VORBIS_160,
-                AudioFileFormat::MP3_160,
-                AudioFileFormat::OGG_VORBIS_96,
-                AudioFileFormat::MP3_96,
-                AudioFileFormat::MP3_256,
-                AudioFileFormat::OGG_VORBIS_320,
-                AudioFileFormat::MP3_320,
-            ],
-            Bitrate::Bitrate320 => [
-                AudioFileFormat::OGG_VORBIS_320,
-                AudioFileFormat::MP3_320,
-                AudioFileFormat::MP3_256,
-                AudioFileFormat::OGG_VORBIS_160,
-                AudioFileFormat::MP3_160,
-                AudioFileFormat::OGG_VORBIS_96,
-                AudioFileFormat::MP3_96,
-            ],
+        let (format, file_id) = match select_file(&audio_item.files, self.config.bitrate) {
+            Some(t) => t,
+            None => {
+                warn!(
+                    "<{}> is not available in any supported format",
+                    audio_item.name
+                );
+                return Err(LoadError::Unavailable);
+            }
         };
 
-        let (format, file_id) =
-            match formats
-                .iter()
-                .find_map(|format| match audio_item.files.get(format) {
-                    Some(&file_id) => Some((*format, file_id)),
-                    _ => None,
-                }) {
-                Some(t) => t,
-                None => {
-                    warn!(
-                        "<{}> is not available in any supported format",
-                        audio_item.name
-                    );
-                    return Err(LoadError::Unavailable);
-                }
-            };
-
-        let bytes_per_second = self
-            .stream_data_rate(format)
-            .ok_or(LoadError::Unavailable)?;
+        let bytes_per_second = stream_data_rate(format).ok_or(LoadError::Unavailable)?;
 
         // This is only a loop to be able to reload the file if an error occurred
         // while opening a cached file.
@@ -2759,8 +2762,45 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadError, PlayerEvent, PlayerTrackLoader};
-    use crate::core::{Error, SpotifyUri, audio_key::AudioKeyError};
+    use super::{LoadError, PlayerEvent, PlayerTrackLoader, select_file, stream_data_rate};
+    use crate::config::Bitrate;
+    use crate::core::{Error, FileId, SpotifyUri, audio_key::AudioKeyError};
+    use crate::metadata::audio::{AudioFileFormat, AudioFiles};
+
+    #[test]
+    fn select_file_follows_format_order_per_bitrate() {
+        use AudioFileFormat::*;
+        let files = |formats: &[AudioFileFormat]| {
+            AudioFiles(formats.iter().map(|f| (*f, FileId([0; 20]))).collect())
+        };
+        let all = files(&[
+            OGG_VORBIS_96,
+            OGG_VORBIS_160,
+            OGG_VORBIS_320,
+            MP3_96,
+            MP3_160,
+            MP3_256,
+            MP3_320,
+        ]);
+        let pick = |files: &AudioFiles, bitrate| select_file(files, bitrate).map(|(f, _)| f);
+
+        assert_eq!(pick(&all, Bitrate::Bitrate96), Some(OGG_VORBIS_96));
+        assert_eq!(pick(&all, Bitrate::Bitrate160), Some(OGG_VORBIS_160));
+        assert_eq!(pick(&all, Bitrate::Bitrate320), Some(OGG_VORBIS_320));
+
+        // Falls back along the order when the preferred format is missing.
+        let mp3_only = files(&[MP3_96, MP3_256]);
+        assert_eq!(pick(&mp3_only, Bitrate::Bitrate96), Some(MP3_96));
+        assert_eq!(pick(&mp3_only, Bitrate::Bitrate160), Some(MP3_96));
+        assert_eq!(pick(&mp3_only, Bitrate::Bitrate320), Some(MP3_256));
+
+        // Podcasts: only 96 kbps Ogg.
+        let podcast = files(&[OGG_VORBIS_96]);
+        assert_eq!(pick(&podcast, Bitrate::Bitrate320), Some(OGG_VORBIS_96));
+
+        assert_eq!(pick(&files(&[]), Bitrate::Bitrate160), None);
+        assert_eq!(stream_data_rate(OGG_VORBIS_160), Some(20 * 1024));
+    }
 
     #[test]
     fn only_an_explicit_audio_key_rejection_is_terminal() {
