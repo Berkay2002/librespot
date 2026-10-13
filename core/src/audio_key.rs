@@ -36,10 +36,34 @@ impl From<AudioKeyError> for Error {
     }
 }
 
+/// In-memory cache of audio keys, so a repeated request skips the round trip.
+/// Memory only: keys are never written next to the encrypted files.
+#[derive(Default)]
+struct KeyCache(HashMap<(SpotifyId, FileId), AudioKey>);
+
+impl KeyCache {
+    const CAPACITY: usize = 1024;
+
+    fn get(&self, track: SpotifyId, file: FileId) -> Option<AudioKey> {
+        self.0.get(&(track, file)).copied()
+    }
+
+    /// Stores successful results only. Clears everything once the cap is reached.
+    fn record(&mut self, track: SpotifyId, file: FileId, result: &Result<AudioKey, Error>) {
+        if let Ok(key) = result {
+            if self.0.len() >= Self::CAPACITY {
+                self.0.clear();
+            }
+            self.0.insert((track, file), *key);
+        }
+    }
+}
+
 component! {
     AudioKeyManager : AudioKeyManagerInner {
         sequence: SeqGenerator<u32> = SeqGenerator::new(0),
         pending: HashMap<u32, oneshot::Sender<Result<AudioKey, Error>>> = HashMap::new(),
+        keys: KeyCache = KeyCache::default(),
     }
 }
 
@@ -79,6 +103,16 @@ impl AudioKeyManager {
     }
 
     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
+        if let Some(key) = self.lock(|inner| inner.keys.get(track, file)) {
+            return Ok(key);
+        }
+
+        let result = self.request_uncached(track, file).await;
+        self.lock(|inner| inner.keys.record(track, file, &result));
+        result
+    }
+
+    async fn request_uncached(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
         let (tx, rx) = oneshot::channel();
 
         let seq = self.lock(move |inner| {
@@ -106,5 +140,58 @@ impl AudioKeyManager {
         data.write_u16::<BigEndian>(0x0000)?;
 
         self.session().send_packet(PacketType::RequestKey, data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(n: u8) -> (SpotifyId, FileId) {
+        let mut track = [0u8; 16];
+        track[15] = n;
+        let mut file = [0u8; 20];
+        file[19] = n;
+        (
+            SpotifyId::from_raw(&track).unwrap(),
+            FileId::from_raw(&file),
+        )
+    }
+
+    #[test]
+    fn hit_and_miss() {
+        let mut cache = KeyCache::default();
+        let (track, file) = ids(1);
+        assert_eq!(cache.get(track, file), None);
+        cache.record(track, file, &Ok(AudioKey([7; 16])));
+        assert_eq!(cache.get(track, file), Some(AudioKey([7; 16])));
+        let (other_track, other_file) = ids(2);
+        assert_eq!(cache.get(other_track, file), None);
+        assert_eq!(cache.get(track, other_file), None);
+    }
+
+    #[test]
+    fn error_is_not_stored() {
+        let mut cache = KeyCache::default();
+        let (track, file) = ids(1);
+        cache.record(track, file, &Err(AudioKeyError::AesKey.into()));
+        assert_eq!(cache.get(track, file), None);
+    }
+
+    #[test]
+    fn clears_at_capacity() {
+        let mut cache = KeyCache::default();
+        for n in 0..KeyCache::CAPACITY {
+            let mut track = [0u8; 16];
+            track[14..].copy_from_slice(&(n as u16).to_be_bytes());
+            let id = SpotifyId::from_raw(&track).unwrap();
+            cache.record(id, FileId([0; 20]), &Ok(AudioKey([1; 16])));
+        }
+        assert_eq!(cache.0.len(), KeyCache::CAPACITY);
+
+        let (track, file) = ids(255);
+        cache.record(track, file, &Ok(AudioKey([2; 16])));
+        assert_eq!(cache.0.len(), 1);
+        assert_eq!(cache.get(track, file), Some(AudioKey([2; 16])));
     }
 }
